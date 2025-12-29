@@ -1,238 +1,234 @@
 import json
-from typing import Optional
+from typing import Optional, Dict, List
+from datetime import datetime, date
 from fastapi import FastAPI, HTTPException
 import uvicorn
 from model.money_model import Transaction, TransactionInput, BudgetInput, CategoryHierarchy
+from enum import Enum
 
-app = FastAPI(title="Money MCP Server - Tally Style")
+app = FastAPI(title="Tally-Style Money MCP Server")
 
-# ============ In-Memory Database ============
-transactions_db = {}
-budgets_db = {}
-
-# Category hierarchy (parent -> subcategories)
-category_hierarchy = {
-    "Food": ["Burger", "Coffee", "Groceries", "Restaurant"],
-    "Transport": ["Fuel", "Taxi", "Public Transport", "Parking"],
-    "Entertainment": ["Movies", "Gaming", "Books", "Sports"],
-    "Utilities": ["Electricity", "Water", "Internet", "Phone"],
-    "Salary": ["Monthly Salary", "Bonus", "Freelance"],
-    "Other": ["Miscellaneous"]
+# ============ TALLY-STYLE LEDGER GROUPS ============
+LEDGER_GROUPS = {
+    "Primary": {
+        "Bank Accounts": ["SBI Current", "HDFC Savings", "ICICI Salary"],
+        "Cash-in-hand": ["Cash"],
+        "Current Assets": ["Accounts Receivable", "Prepaid Expenses"],
+        "Current Liabilities": ["Accounts Payable", "Outstanding Expenses"],
+        "Capital Account": ["Owner's Capital"],
+        "Direct Income": ["Sales Account"],
+        "Direct Expenses": ["Purchase Account"]
+    },
+    "Income Categories": {
+        "Salary": ["Monthly Salary", "Bonus", "Freelance"],
+        "Other Income": ["Interest Received", "Rent Received"]
+    },
+    "Expense Categories": {
+        "Food": ["Groceries", "Restaurant", "Coffee"],
+        "Transport": ["Fuel", "Taxi", "Public Transport"],
+        "Utilities": ["Electricity", "Internet", "Phone"]
+    }
 }
 
-# ============ Helper Functions ============
-def get_all_subcategories(category: str) -> list[str]:
-    """Get all subcategories for a parent category"""
-    return category_hierarchy.get(category, [])
+# ============ LEDGER ACCOUNTS (Tally Style) ============
+class AccountType(str, Enum):
+    BANK = "Bank"
+    CASH = "Cash"
+    ASSET = "Asset"
+    LIABILITY = "Liability"
+    INCOME = "Income"
+    EXPENSE = "Expense"
+    CAPITAL = "Capital"
 
-def is_parent_category(category: str) -> bool:
-    """Check if category is a parent category"""
-    return category in category_hierarchy
+ledgers: Dict[str, Dict] = {}  # ledger_name -> {balance, type, transactions}
+transactions_db: Dict[str, Dict] = {}
+budgets_db: Dict[str, float] = {}
 
-def get_parent_category(subcategory: str) -> Optional[str]:
-    """Get parent category for a subcategory"""
-    for parent, subs in category_hierarchy.items():
-        if subcategory in subs:
-            return parent
-    return None
-
-# ============ Money MCP Endpoints ============
-
-@app.post("/add_transaction")
-def add_transaction(tx: TransactionInput):
-    """Add a new transaction with category/subcategory"""
-    # Validate subcategory belongs to category
-    if tx.subcategory not in get_all_subcategories(tx.category):
-        raise HTTPException(status_code=400, detail=f"{tx.subcategory} is not under {tx.category}")
+def create_ledger(name: str, account_type: AccountType, group: str, opening_balance: float = 0.0):
+    """Create new ledger account like Tally"""
+    if name in ledgers:
+        raise HTTPException(400, f"Ledger {name} already exists")
     
-    tx_id = f"tx_{len(transactions_db) + 1}"
-    transactions_db[tx_id] = {
+    ledgers[name] = {
+        "name": name,
+        "type": account_type,
+        "group": group,
+        "opening_balance": opening_balance,
+        "current_balance": opening_balance,
+        "transactions": []
+    }
+    return {"status": "success", "ledger": name}
+
+# Initialize default ledgers (Tally style)
+@app.on_event("startup")
+async def init_ledgers():
+    default_ledgers = [
+        ("SBI Current", AccountType.BANK, "Bank Accounts", 50000),
+        ("HDFC Savings", AccountType.BANK, "Bank Accounts", 25000),
+        ("Cash", AccountType.CASH, "Cash-in-hand", 5000),
+        ("Owner's Capital", AccountType.CAPITAL, "Capital Account", 80000)
+    ]
+    for name, acc_type, group, balance in default_ledgers:
+        create_ledger(name, acc_type, group, balance)
+
+# ============ TALLY-STYLE TRANSACTIONS ============
+@app.post("/voucher/payment")  # Payment Voucher
+def payment_voucher(tx: TransactionInput):
+    """Payment voucher - Money going out (Expense/Payable)"""
+    ledger = tx.ledger or "Cash"  # Default cash payment
+    if ledger not in ledgers:
+        raise HTTPException(400, f"Ledger {ledger} not found")
+    
+    tx_id = f"pay_{len(transactions_db) + 1}"
+    transaction = {
         "id": tx_id,
+        "date": tx.date,
+        "ledger": ledger,
         "amount": tx.amount,
+        "type": "Dr",  # Debit Expense/Cash Out
         "category": tx.category,
         "subcategory": tx.subcategory,
-        "description": tx.description,
+        "narration": tx.description,
+        "voucher_type": "Payment"
+    }
+    
+    # Update ledger balance (Debit increases expense)
+    ledgers[ledger]["current_balance"] += tx.amount
+    ledgers[ledger]["transactions"].append(transaction)
+    
+    transactions_db[tx_id] = transaction
+    return {"status": "success", "voucher_no": tx_id, "ledger_balance": ledgers[ledger]["current_balance"]}
+
+@app.post("/voucher/receipt")  # Receipt Voucher
+def receipt_voucher(tx: TransactionInput):
+    """Receipt voucher - Money coming in (Income/Receivable)"""
+    ledger = tx.ledger or "Cash"
+    if ledger not in ledgers:
+        raise HTTPException(400, f"Ledger {ledger} not found")
+    
+    tx_id = f"rec_{len(transactions_db) + 1}"
+    transaction = {
+        "id": tx_id,
         "date": tx.date,
-        "type": tx.type  # income or expense
+        "ledger": ledger,
+        "amount": tx.amount,
+        "type": "Cr",  # Credit Income/Cash In
+        "category": tx.category,
+        "subcategory": tx.subcategory,
+        "narration": tx.description,
+        "voucher_type": "Receipt"
     }
-    return {"status": "success", "transaction_id": tx_id, "data": transactions_db[tx_id]}
+    
+    # Update ledger balance (Credit decreases bank balance)
+    ledgers[ledger]["current_balance"] -= tx.amount
+    ledgers[ledger]["transactions"].append(transaction)
+    
+    transactions_db[tx_id] = transaction
+    return {"status": "success", "voucher_no": tx_id, "ledger_balance": ledgers[ledger]["current_balance"]}
 
-@app.get("/get_transactions")
-def get_transactions(category: Optional[str] = None, subcategory: Optional[str] = None):
-    """Get transactions filtered by category/subcategory"""
-    filtered = dict(transactions_db)
-    
-    if category:
-        filtered = {k: v for k, v in filtered.items() if v["category"].lower() == category.lower()}
-    
-    if subcategory:
-        filtered = {k: v for k, v in filtered.items() if v["subcategory"].lower() == subcategory.lower()}
-    
-    return {"status": "success", "transactions": filtered}
-
-@app.get("/get_spending/{query}")
-def get_spending(query: str):
-    """
-    Get spending for category OR subcategory
-    Examples: "Food" (returns all food spending), "Burger" (returns only burger)
-    """
-    # Check if it's a parent category
-    if is_parent_category(query):
-        subcats = get_all_subcategories(query)
-        total = sum(tx["amount"] for tx in transactions_db.values() 
-                   if tx["subcategory"] in subcats and tx["type"] == "expense")
-        breakdown = {}
-        for subcat in subcats:
-            subcat_total = sum(tx["amount"] for tx in transactions_db.values() 
-                             if tx["subcategory"] == subcat and tx["type"] == "expense")
-            if subcat_total > 0:
-                breakdown[subcat] = subcat_total
-        
-        return {
-            "status": "success",
-            "type": "parent_category",
-            "category": query,
-            "total_spending": total,
-            "breakdown": breakdown
-        }
-    
-    # Check if it's a subcategory
-    parent = get_parent_category(query)
-    if parent:
-        total = sum(tx["amount"] for tx in transactions_db.values() 
-                   if tx["subcategory"].lower() == query.lower() and tx["type"] == "expense")
-        return {
-            "status": "success",
-            "type": "subcategory",
-            "subcategory": query,
-            "parent_category": parent,
-            "total_spending": total
-        }
-    
-    return {"status": "error", "message": f"{query} not found in categories"}
-
-@app.get("/get_income/{query}")
-def get_income(query: str):
-    """Get income for category OR subcategory"""
-    if is_parent_category(query):
-        subcats = get_all_subcategories(query)
-        total = sum(tx["amount"] for tx in transactions_db.values() 
-                   if tx["subcategory"] in subcats and tx["type"] == "income")
-        return {"status": "success", "category": query, "total_income": total}
-    
-    parent = get_parent_category(query)
-    if parent:
-        total = sum(tx["amount"] for tx in transactions_db.values() 
-                   if tx["subcategory"].lower() == query.lower() and tx["type"] == "income")
-        return {"status": "success", "subcategory": query, "total_income": total}
-    
-    return {"status": "error", "message": f"{query} not found in categories"}
-
-@app.post("/set_budget")
-def set_budget(budget: BudgetInput):
-    """Set budget limit for category or subcategory"""
-    budget_key = budget.category
-    if budget.subcategory:
-        budget_key = f"{budget.category}:{budget.subcategory}"
-    
-    budgets_db[budget_key] = budget.limit
-    return {"status": "success", "budget_key": budget_key, "limit": budget.limit}
-
-@app.get("/check_budget/{query}")
-def check_budget(query: str):
-    """Check if spending exceeds budget"""
-    budget_key = None
-    spending = 0
-    
-    if is_parent_category(query):
-        budget_key = query
-        subcats = get_all_subcategories(query)
-        spending = sum(tx["amount"] for tx in transactions_db.values() 
-                      if tx["subcategory"] in subcats and tx["type"] == "expense")
-    else:
-        parent = get_parent_category(query)
-        if parent:
-            budget_key = f"{parent}:{query}"
-            spending = sum(tx["amount"] for tx in transactions_db.values() 
-                          if tx["subcategory"].lower() == query.lower() and tx["type"] == "expense")
-    
-    if not budget_key or budget_key not in budgets_db:
-        return {"status": "error", "message": f"No budget set for {query}"}
-    
-    limit = budgets_db[budget_key]
-    exceeded = spending > limit
+# ============ TALLY AUTOMATION ENDPOINTS ============
+@app.get("/trial-balance")
+def trial_balance():
+    """Tally Trial Balance - Verify Debit = Credit"""
+    debit_total = sum(ledger["current_balance"] for ledger in ledgers.values() 
+                     if ledger["type"] in ["Expense", "Asset", "Cash", "Bank"])
+    credit_total = sum(ledger["current_balance"] for ledger in ledgers.values() 
+                      if ledger["type"] in ["Income", "Liability", "Capital"])
     
     return {
         "status": "success",
-        "query": query,
-        "spending": spending,
-        "budget_limit": limit,
-        "exceeded": exceeded,
-        "remaining": limit - spending,
-        "percentage": round((spending / limit) * 100, 2)
+        "date": date.today().isoformat(),
+        "debit_total": debit_total,
+        "credit_total": credit_total,
+        "balanced": abs(debit_total - credit_total) < 0.01,
+        "ledgers": {name: ledger["current_balance"] for name, ledger in ledgers.items()}
     }
 
-@app.get("/balance")
-def get_balance():
-    """Get income vs expense balance (Tally style)"""
-    total_income = sum(tx["amount"] for tx in transactions_db.values() if tx["type"] == "income")
-    total_expense = sum(tx["amount"] for tx in transactions_db.values() if tx["type"] == "expense")
-    balance = total_income - total_expense
+@app.get("/balance-sheet")
+def balance_sheet():
+    """Tally Balance Sheet - Assets = Liabilities + Capital"""
+    assets = sum(ledger["current_balance"] for ledger in ledgers.values() 
+                if ledger["type"] in ["Asset", "Cash", "Bank"])
+    liabilities = sum(ledger["current_balance"] for ledger in ledgers.values() 
+                     if ledger["type"] == "Liability")
+    capital = sum(ledger["current_balance"] for ledger in ledgers.values() 
+                 if ledger["type"] == "Capital")
     
     return {
         "status": "success",
-        "total_income": total_income,
-        "total_expense": total_expense,
-        "balance": balance,
-        "savings_rate": round((balance / total_income * 100), 2) if total_income > 0 else 0
+        "as_on_date": date.today().isoformat(),
+        "assets": assets,
+        "liabilities": liabilities,
+        "capital": capital,
+        "net_worth": capital + liabilities - assets,
+        "balanced": abs(assets - (liabilities + capital)) < 0.01
     }
 
-@app.get("/summary")
-def get_summary():
-    """Get complete spending/income summary by parent category"""
-    summary = {
-        "expenses": {},
-        "income": {},
-        "total_income": 0,
-        "total_expense": 0
+@app.get("/bank-reconciliation/{ledger_name}")
+def bank_reconciliation(ledger_name: str):
+    """Daily Bank Reconciliation like Tally"""
+    if ledger_name not in ledgers:
+        raise HTTPException(404, f"Ledger {ledger_name} not found")
+    
+    ledger = ledgers[ledger_name]
+    transactions = ledger["transactions"][-30:]  # Last 30 days
+    
+    reconciled = sum(t["amount"] for t in transactions if t.get("reconciled", False))
+    pending = sum(t["amount"] for t in transactions if not t.get("reconciled", False))
+    
+    return {
+        "status": "success",
+        "ledger": ledger_name,
+        "current_balance": ledger["current_balance"],
+        "total_transactions": len(transactions),
+        "reconciled_amount": reconciled,
+        "pending_amount": pending,
+        "reconciliation_status": "Complete" if pending == 0 else "Pending"
     }
-    
-    for parent in category_hierarchy.keys():
-        subcats = get_all_subcategories(parent)
-        
-        expense_total = sum(tx["amount"] for tx in transactions_db.values() 
-                           if tx["subcategory"] in subcats and tx["type"] == "expense")
-        income_total = sum(tx["amount"] for tx in transactions_db.values() 
-                          if tx["subcategory"] in subcats and tx["type"] == "income")
-        
-        if expense_total > 0:
-            summary["expenses"][parent] = expense_total
-        if income_total > 0:
-            summary["income"][parent] = income_total
-    
-    summary["total_income"] = sum(summary["income"].values())
-    summary["total_expense"] = sum(summary["expenses"].values())
-    
-    return {"status": "success", "summary": summary}
 
-@app.get("/categories")
-def get_categories():
-    """Get all categories and subcategories"""
-    return {"status": "success", "categories": category_hierarchy}
-
-@app.post("/add_category")
-def add_category(data: CategoryHierarchy):
-    """Add new parent category with subcategories"""
-    if data.parent_category in category_hierarchy:
-        return {"status": "error", "message": f"{data.parent_category} already exists"}
+@app.get("/cash-flow")
+def cash_flow_summary():
+    """Daily Cash Flow Statement"""
+    cash_ledgers = ["Cash", "SBI Current", "HDFC Savings"]
+    today = date.today().isoformat()
     
-    category_hierarchy[data.parent_category] = data.subcategories
-    return {"status": "success", "message": f"{data.parent_category} added", "categories": category_hierarchy}
+    today_inflow = sum(t["amount"] for tx in transactions_db.values() 
+                      if tx["date"] == today and tx["voucher_type"] == "Receipt")
+    today_outflow = sum(t["amount"] for tx in transactions_db.values() 
+                       if tx["date"] == today and tx["voucher_type"] == "Payment")
+    
+    return {
+        "status": "success",
+        "date": today,
+        "opening_balance": sum(ledgers[l]["current_balance"] for l in cash_ledgers),
+        "today_inflow": today_inflow,
+        "today_outflow": today_outflow,
+        "net_cash_flow": today_inflow - today_outflow,
+        "closing_balance": sum(ledgers[l]["current_balance"] for l in cash_ledgers)
+    }
 
+@app.get("/ledgers")
+def get_ledgers():
+    """List all ledger accounts with balances"""
+    return {
+        "status": "success",
+        "total_ledgers": len(ledgers),
+        "ledgers": [
+            {
+                "name": ledger["name"],
+                "group": ledger["group"],
+                "type": ledger["type"],
+                "balance": ledger["current_balance"],
+                "opening_balance": ledger["opening_balance"]
+            }
+            for ledger in ledgers.values()
+        ]
+    }
+
+# Keep existing endpoints for backward compatibility
 @app.get("/health")
 def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "money_mcp"}
+    return {"status": "healthy", "service": "tally_money_mcp", "ledgers_count": len(ledgers)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
